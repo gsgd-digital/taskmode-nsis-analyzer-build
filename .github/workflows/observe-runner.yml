@@ -1,0 +1,166 @@
+name: Observe Windows runner identity
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  observe:
+    name: Observe windows-2022 identity
+    runs-on: windows-2022
+    timeout-minutes: 10
+
+    steps:
+      - name: Collect runner and toolchain identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          function Section([string]$Name) {
+            Write-Host ""
+            Write-Host "===== $Name ====="
+          }
+
+          function FileIdentity([string]$Path) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              Write-Host "MISSING: $Path"
+              return
+            }
+            $item = Get-Item -LiteralPath $Path
+            $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $Path
+            [pscustomobject]@{
+              Path = $item.FullName
+              Length = $item.Length
+              FileVersion = $item.VersionInfo.FileVersion
+              ProductVersion = $item.VersionInfo.ProductVersion
+              SHA256 = $hash.Hash.ToLowerInvariant()
+            } | Format-List | Out-String | Write-Host
+          }
+
+          Section "GitHub run provenance"
+          [pscustomobject]@{
+            Repository = $env:GITHUB_REPOSITORY
+            RunId = $env:GITHUB_RUN_ID
+            RunAttempt = $env:GITHUB_RUN_ATTEMPT
+            Workflow = $env:GITHUB_WORKFLOW
+            WorkflowRef = $env:GITHUB_WORKFLOW_REF
+            WorkflowSha = $env:GITHUB_WORKFLOW_SHA
+            TriggerSha = $env:GITHUB_SHA
+            Ref = $env:GITHUB_REF
+            RefName = $env:GITHUB_REF_NAME
+            Actor = $env:GITHUB_ACTOR
+            RunnerName = $env:RUNNER_NAME
+            RunnerOS = $env:RUNNER_OS
+            RunnerArch = $env:RUNNER_ARCH
+            ImageOS = $env:ImageOS
+            ImageVersion = $env:ImageVersion
+          } | Format-List | Out-String | Write-Host
+
+          Section "Operating system"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture, InstallDate |
+            Format-List | Out-String | Write-Host
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture |
+            Format-List | Out-String | Write-Host
+
+          Section "Runner resources"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors |
+            Format-List | Out-String | Write-Host
+          $cs = Get-CimInstance Win32_ComputerSystem
+          [pscustomobject]@{
+            TotalPhysicalMemoryBytes = [int64]$cs.TotalPhysicalMemory
+            TotalPhysicalMemoryGiB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+          } | Format-List | Out-String | Write-Host
+          Get-PSDrive -Name C |
+            Select-Object Name,
+              @{N='UsedGiB';E={[math]::Round($_.Used / 1GB, 2)}},
+              @{N='FreeGiB';E={[math]::Round($_.Free / 1GB, 2)}} |
+            Format-List | Out-String | Write-Host
+
+          Section "Privilege and network trust context"
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          [pscustomobject]@{
+            Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            IsAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          } | Format-List | Out-String | Write-Host
+          Get-NetFirewallProfile |
+            Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Select-Object InterfaceAlias, NextHop, RouteMetric, State |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          Section "Visual Studio instance identity"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe not found at expected path: $vswhere"
+          }
+          FileIdentity $vswhere
+          & $vswhere -all -products * -format json -utf8 | Write-Host
+
+          $installPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $installPath) {
+            throw 'No Visual Studio instance with VC.Tools.x86.x64 found'
+          }
+          Write-Host "SelectedVSInstallationPath=$installPath"
+
+          Section "MSVC toolset directories"
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          $toolsets = Get-ChildItem -LiteralPath $msvcRoot -Directory | Sort-Object Name
+          $toolsets | Select-Object Name, FullName | Format-Table -AutoSize | Out-String | Write-Host
+          if (-not $toolsets) {
+            throw "No MSVC toolset directories found under $msvcRoot"
+          }
+
+          $selectedToolset = $toolsets | Sort-Object Name -Descending | Select-Object -First 1
+          $cl = Join-Path $selectedToolset.FullName 'bin\Hostx64\x64\cl.exe'
+          $link = Join-Path $selectedToolset.FullName 'bin\Hostx64\x64\link.exe'
+
+          Section "cl.exe identity"
+          FileIdentity $cl
+          & $cl /Bv 2>&1 | ForEach-Object { Write-Host $_ }
+
+          Section "link.exe identity"
+          FileIdentity $link
+          & $link /? 2>&1 | Select-Object -First 8 | ForEach-Object { Write-Host $_ }
+
+          Section "Windows SDK identity"
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $includeRoot = Join-Path $kitsRoot 'Include'
+          $binRoot = Join-Path $kitsRoot 'bin'
+          Write-Host "WindowsKitsRoot=$kitsRoot"
+          if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots') {
+            Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' |
+              Select-Object KitsRoot10 |
+              Format-List | Out-String | Write-Host
+          }
+          Get-ChildItem -LiteralPath $includeRoot -Directory -ErrorAction SilentlyContinue |
+            Select-Object Name, FullName |
+            Sort-Object Name |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Get-ChildItem -LiteralPath $binRoot -Directory -ErrorAction SilentlyContinue |
+            Select-Object Name, FullName |
+            Sort-Object Name |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          $sdkBins = Get-ChildItem -LiteralPath $binRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
+            Sort-Object Name
+          if ($sdkBins) {
+            $selectedSdk = $sdkBins | Select-Object -Last 1
+            $rc = Join-Path $selectedSdk.FullName 'x64\rc.exe'
+            Section "Selected SDK rc.exe identity"
+            Write-Host "SelectedSDKDirectory=$($selectedSdk.Name)"
+            FileIdentity $rc
+          }
+
+          Section "PowerShell and .NET provenance"
+          $PSVersionTable | Format-List | Out-String | Write-Host
+          & dotnet --info 2>&1 | ForEach-Object { Write-Host $_ }
+
+          Section "Observation completed"
+          Write-Host "No checkout, package acquisition, compilation, linking, artifact upload, target execution, or analyzer execution was performed."
