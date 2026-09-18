@@ -1,0 +1,240 @@
+name: Observe native build closure
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  observe-closure:
+    name: Observe native build closure
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Fingerprint existing native build closure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          function Section([string]$Name) {
+            Write-Host ""
+            Write-Host "===== $Name ====="
+          }
+
+          function FileIdentity([string]$Path) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "Required file missing: $Path"
+            }
+            $item = Get-Item -LiteralPath $Path
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+              throw "Reparse-point file not admitted: $Path"
+            }
+            $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $Path
+            [pscustomobject]@{
+              Path = $item.FullName
+              Length = $item.Length
+              FileVersion = $item.VersionInfo.FileVersion
+              ProductVersion = $item.VersionInfo.ProductVersion
+              SHA256 = $hash.Hash.ToLowerInvariant()
+            } | Format-List | Out-String | Write-Host
+          }
+
+          function OptionalFileIdentity([string]$Path) {
+            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+              FileIdentity $Path
+            } else {
+              Write-Host "OPTIONAL_MISSING: $Path"
+            }
+          }
+
+          function TreeDigest([string]$Label, [string]$Root) {
+            if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+              throw "Required tree missing: $Label -> $Root"
+            }
+
+            $rootPath = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\')
+            $entries = Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force -ErrorAction Stop |
+              Sort-Object { $_.FullName.Substring($rootPath.Length + 1).Replace('\','/') }
+
+            $hasher = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+              [System.Security.Cryptography.HashAlgorithmName]::SHA256
+            )
+            [int64]$totalBytes = 0
+            [int64]$fileCount = 0
+            try {
+              foreach ($file in $entries) {
+                if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                  throw "Reparse-point file not admitted in $Label : $($file.FullName)"
+                }
+                $relative = $file.FullName.Substring($rootPath.Length + 1).Replace('\','/')
+                $fileHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+                $line = "$relative|$($file.Length)|$fileHash" + [char]10
+                $hasher.AppendData([Text.Encoding]::UTF8.GetBytes($line))
+                $totalBytes += [int64]$file.Length
+                $fileCount++
+              }
+              $digest = [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant()
+            } finally {
+              $hasher.Dispose()
+            }
+
+            [pscustomobject]@{
+              Label = $Label
+              Root = $rootPath
+              FileCount = $fileCount
+              TotalBytes = $totalBytes
+              ManifestAlgorithm = 'sorted-relative-path|length|sha256 + LF; SHA256 over UTF-8 manifest'
+              TreeSHA256 = $digest
+            } | Format-List | Out-String | Write-Host
+          }
+
+          Section "GitHub run provenance"
+          [pscustomobject]@{
+            Repository = $env:GITHUB_REPOSITORY
+            RunId = $env:GITHUB_RUN_ID
+            RunAttempt = $env:GITHUB_RUN_ATTEMPT
+            Workflow = $env:GITHUB_WORKFLOW
+            WorkflowRef = $env:GITHUB_WORKFLOW_REF
+            WorkflowSha = $env:GITHUB_WORKFLOW_SHA
+            TriggerSha = $env:GITHUB_SHA
+            Ref = $env:GITHUB_REF
+            RefName = $env:GITHUB_REF_NAME
+            Actor = $env:GITHUB_ACTOR
+            RunnerName = $env:RUNNER_NAME
+            RunnerOS = $env:RUNNER_OS
+            RunnerArch = $env:RUNNER_ARCH
+            ImageOS = $env:ImageOS
+            ImageVersion = $env:ImageVersion
+          } | Format-List | Out-String | Write-Host
+
+          Section "Operating system and UBR"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List | Out-String | Write-Host
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' |
+            Select-Object ProductName, EditionID, DisplayVersion, CurrentBuild, CurrentBuildNumber, UBR, BuildLabEx |
+            Format-List | Out-String | Write-Host
+
+          Section "Build-only trust context"
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          [pscustomobject]@{
+            Identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            IsAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          } | Format-List | Out-String | Write-Host
+          Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Select-Object InterfaceAlias, NextHop, RouteMetric, State |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          Section "Visual Studio instance and installer state"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          FileIdentity $vswhere
+          $vsRaw = & $vswhere -all -products * -format json -utf8
+          $vsRaw | Write-Host
+          $vsInstances = $vsRaw | ConvertFrom-Json
+          $selected = @($vsInstances | Where-Object {
+            $_.isComplete -eq $true -and $_.installationPath -match 'Visual Studio\\2022'
+          } | Sort-Object installationVersion -Descending)[0]
+          if (-not $selected) {
+            throw 'No complete Visual Studio 2022 instance found'
+          }
+
+          $installPath = [string]$selected.installationPath
+          $instanceId = [string]$selected.instanceId
+          Write-Host "SelectedVSInstallationPath=$installPath"
+          Write-Host "SelectedVSInstanceId=$instanceId"
+
+          $instanceMeta = Join-Path $env:ProgramData "Microsoft\VisualStudio\Packages\_Instances\$instanceId"
+          TreeDigest 'VS_INSTANCE_METADATA' $instanceMeta
+          OptionalFileIdentity (Join-Path $instanceMeta 'state.json')
+          OptionalFileIdentity (Join-Path $instanceMeta 'catalog.json')
+
+          Section "MSVC toolset selection"
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          $toolsets = Get-ChildItem -LiteralPath $msvcRoot -Directory |
+            Sort-Object { [version]$_.Name }
+          $toolsets | Select-Object Name, FullName | Format-Table -AutoSize | Out-String | Write-Host
+          if (-not $toolsets) {
+            throw "No MSVC toolsets found under $msvcRoot"
+          }
+          $selectedToolset = $toolsets | Select-Object -Last 1
+          Write-Host "SelectedMSVCToolset=$($selectedToolset.Name)"
+
+          $hostBin = Join-Path $selectedToolset.FullName 'bin\Hostx64\x64'
+          $msvcInclude = Join-Path $selectedToolset.FullName 'include'
+          $msvcLibX64 = Join-Path $selectedToolset.FullName 'lib\x64'
+
+          Section "Key native build tools and compiler helpers"
+          $keyTools = @(
+            'nmake.exe',
+            'ml64.exe',
+            'cl.exe',
+            'link.exe',
+            'c1.dll',
+            'c1xx.dll',
+            'c2.dll',
+            'mspdb140.dll',
+            'mspdbcore.dll',
+            'mspdbsrv.exe'
+          )
+          foreach ($name in $keyTools) {
+            OptionalFileIdentity (Join-Path $hostBin $name)
+          }
+          OptionalFileIdentity (Join-Path $hostBin '1033\clui.dll')
+          OptionalFileIdentity (Join-Path $hostBin '1033\linkui.dll')
+
+          Section "MSVC deterministic tree digests"
+          TreeDigest 'MSVC_HOSTX64_X64_BIN' $hostBin
+          TreeDigest 'MSVC_INCLUDE' $msvcInclude
+          TreeDigest 'MSVC_LIB_X64' $msvcLibX64
+
+          Section "Visual Studio environment-script closure"
+          $auxBuild = Join-Path $installPath 'VC\Auxiliary\Build'
+          $commonTools = Join-Path $installPath 'Common7\Tools'
+          TreeDigest 'VC_AUXILIARY_BUILD' $auxBuild
+          FileIdentity (Join-Path $commonTools 'VsDevCmd.bat')
+          $vsDevCmdTree = Join-Path $commonTools 'vsdevcmd'
+          if (Test-Path -LiteralPath $vsDevCmdTree -PathType Container) {
+            TreeDigest 'VSDEVCMD_SCRIPT_TREE' $vsDevCmdTree
+          } else {
+            Write-Host "OPTIONAL_TREE_MISSING: $vsDevCmdTree"
+          }
+
+          Section "Windows SDK selection"
+          $kitsRoot = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots').KitsRoot10
+          if (-not $kitsRoot) {
+            throw 'KitsRoot10 not found'
+          }
+          Write-Host "WindowsKitsRoot=$kitsRoot"
+          $sdkIncludeBase = Join-Path $kitsRoot 'Include'
+          $sdkVersions = Get-ChildItem -LiteralPath $sdkIncludeBase -Directory |
+            Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
+            Sort-Object { [version]$_.Name }
+          if (-not $sdkVersions) {
+            throw 'No versioned Windows SDK Include directories found'
+          }
+          $selectedSdk = $sdkVersions | Select-Object -Last 1
+          $sdkVersion = $selectedSdk.Name
+          Write-Host "SelectedSDKVersion=$sdkVersion"
+
+          $sdkInclude = Join-Path $kitsRoot "Include\$sdkVersion"
+          $sdkLibUcrt = Join-Path $kitsRoot "Lib\$sdkVersion\ucrt\x64"
+          $sdkLibUm = Join-Path $kitsRoot "Lib\$sdkVersion\um\x64"
+          $sdkBinX64 = Join-Path $kitsRoot "bin\$sdkVersion\x64"
+
+          OptionalFileIdentity (Join-Path $sdkBinX64 'rc.exe')
+          OptionalFileIdentity (Join-Path $sdkBinX64 'rcdll.dll')
+          TreeDigest 'WINDOWS_SDK_INCLUDE' $sdkInclude
+          TreeDigest 'WINDOWS_SDK_LIB_UCRT_X64' $sdkLibUcrt
+          TreeDigest 'WINDOWS_SDK_LIB_UM_X64' $sdkLibUm
+          TreeDigest 'WINDOWS_SDK_BIN_X64' $sdkBinX64
+
+          Section "Bounded system runtime identities"
+          $system32 = Join-Path $env:SystemRoot 'System32'
+          foreach ($name in @('cmd.exe','kernel32.dll','kernelbase.dll','ntdll.dll','ucrtbase.dll','advapi32.dll')) {
+            FileIdentity (Join-Path $system32 $name)
+          }
+
+          Section "H2 closure observation completed"
+          Write-Host 'No checkout, source/package acquisition, compilation, linking, build artifact generation/upload, target execution, or analyzer execution was performed.'
